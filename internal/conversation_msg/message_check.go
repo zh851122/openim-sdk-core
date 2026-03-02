@@ -597,23 +597,54 @@ func (c *Conversation) groupHandle(ctx context.Context, self, others []*model_st
 	userIDs := datautil.Distinct(allSenders)
 	specialUsersInfo, missKeys := c.user.UserCache().BatchGetSpecialUser(ctx, userIDs)
 
-	groupMap, err := c.group.GetGroupMembersInfo(ctx, lc.GroupID, missKeys)
-	if err != nil {
-		log.ZError(ctx, "get group member info err", err)
-		return
+	// If WS message already carries sender nickname, avoid extra group member lookup.
+	needGroupLookup := make(map[string]struct{})
+	for _, chatLog := range allMessage {
+		if chatLog.SenderNickname == "" {
+			needGroupLookup[chatLog.SendID] = struct{}{}
+		}
+	}
+	groupLookupIDs := make([]string, 0, len(missKeys))
+	for _, userID := range missKeys {
+		if _, ok := needGroupLookup[userID]; ok {
+			groupLookupIDs = append(groupLookupIDs, userID)
+		}
+	}
+
+	groupMap := make(map[string]*model_struct.LocalGroupMember)
+	if len(groupLookupIDs) > 0 {
+		fetchedGroupMap, err := c.group.GetGroupMembersInfo(ctx, lc.GroupID, groupLookupIDs)
+		if err != nil {
+			log.ZError(ctx, "get group member info err", err)
+		} else {
+			groupMap = fetchedGroupMap
+		}
 	}
 	specialUsers := make(map[string]*model_struct.LocalUser)
 	for _, chatLog := range allMessage {
+		// The sender nickname is already carried by the message body.
+		if chatLog.SenderNickname != "" {
+			if chatLog.SenderFaceURL == "" {
+				if u, ok := specialUsersInfo[chatLog.SendID]; ok && u.FaceURL != "" {
+					chatLog.SenderFaceURL = u.FaceURL
+				}
+			}
+			continue
+		}
 		if g, ok := groupMap[chatLog.SendID]; ok { // If group member info is successfully retrieved
 			log.ZDebug(ctx, "find in GetGroupMemberNameAndFaceURL", "sendID", chatLog.SendID, "faceURL", g.FaceURL, "nickName", g.Nickname)
-			if g.FaceURL != "" && g.Nickname != "" {
-				chatLog.SenderFaceURL = g.FaceURL
+			if g.Nickname != "" {
 				chatLog.SenderNickname = g.Nickname
 			}
+			if g.FaceURL != "" {
+				chatLog.SenderFaceURL = g.FaceURL
+			}
 		} else if u, ok := specialUsersInfo[chatLog.SendID]; ok {
-			if u.FaceURL != "" && u.Nickname != "" {
-				chatLog.SenderFaceURL = u.FaceURL
+			if u.Nickname != "" {
 				chatLog.SenderNickname = u.Nickname
+			}
+			if u.FaceURL != "" {
+				chatLog.SenderFaceURL = u.FaceURL
 			}
 		} else { // Otherwise, retrieve from local temporary cache
 			// Maybe it's a user information that doesn't exist on the server, but has sent a message before or admin user.

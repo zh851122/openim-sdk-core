@@ -56,7 +56,7 @@ func (m *MetaManager) NewApiMsgSender() *ApiMsgSender {
 	return &ApiMsgSender{m}
 }
 
-func (m *MetaManager) apiPost(ctx context.Context, route string, req, resp any) (err error) {
+func (m *MetaManager) apiPostWithToken(ctx context.Context, route string, req, resp any, token string) (err error) {
 	operationID, _ := ctx.Value("operationID").(string)
 	if operationID == "" {
 		return errs.ErrArgs.WrapMsg("call api operationID is empty")
@@ -75,7 +75,9 @@ func (m *MetaManager) apiPost(ctx context.Context, route string, req, resp any) 
 	request.ContentLength = int64(len(reqBody))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("operationID", operationID)
-	if m.token != "" {
+	if token != "" {
+		request.Header.Set("token", token)
+	} else if m.token != "" {
 		request.Header.Set("token", m.token)
 	}
 	response, err := new(http.Client).Do(request)
@@ -107,8 +109,16 @@ func (m *MetaManager) apiPost(ctx context.Context, route string, req, resp any) 
 	return nil
 }
 
+func (m *MetaManager) apiPost(ctx context.Context, route string, req, resp any) (err error) {
+	return m.apiPostWithToken(ctx, route, req, resp, "")
+}
+
 func (m *MetaManager) postWithCtx(route string, req, resp any) error {
 	return m.apiPost(m.buildCtx(), route, req, resp)
+}
+
+func (m *MetaManager) postWithTokenCtx(route string, token string, req, resp any) error {
+	return m.apiPostWithToken(m.buildCtx(), route, req, resp, token)
 }
 
 func (m *MetaManager) buildCtx() context.Context {

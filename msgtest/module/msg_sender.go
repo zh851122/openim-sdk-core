@@ -15,7 +15,6 @@ import (
 	"github.com/openimsdk/openim-sdk-core/v3/pkg/constant"
 	"github.com/openimsdk/openim-sdk-core/v3/pkg/utils"
 	"github.com/openimsdk/openim-sdk-core/v3/sdk_struct"
-	pbconstant "github.com/openimsdk/protocol/constant"
 	"github.com/openimsdk/protocol/sdkws"
 	"github.com/openimsdk/tools/log"
 	"github.com/openimsdk/tools/mcontext"
@@ -90,6 +89,7 @@ type SendMsgUser struct {
 	pushMsgAndMaxSeqCh      chan common.Cmd2Value
 	recvPushMsgCallback     func(msg *sdkws.MsgData)
 	p                       *PressureTester
+	platformID              int32
 	singleFailedMessageMap  map[string]*errorValue
 	groupFailedMessageMap   map[string][]*errorValue
 	cancelFunc              context.CancelFunc
@@ -145,6 +145,7 @@ func NewUser(userID, token string, timeOffset int64, p *PressureTester, imConfig
 		groupRecvSampleInfo:     make(map[string]*groupMessageValue),
 		timeOffset:              timeOffset,
 		ctx:                     ctx,
+		platformID:              imConfig.PlatformID,
 	}
 	for _, opt := range opts {
 		opt(core)
@@ -174,6 +175,11 @@ func (b *SendMsgUser) SendGroupMsgWithContext(groupID string, index int) error {
 	newCtx := mcontext.SetOperationID(b.ctx, b.userID+utils.OperationIDGenerator()+groupID)
 	return b.SendGroupMsg(newCtx, groupID, index)
 
+}
+
+func (b *SendMsgUser) SendGroupCustomMsgWithContext(groupID string, index int, content string) error {
+	newCtx := mcontext.SetOperationID(b.ctx, b.userID+utils.OperationIDGenerator()+groupID)
+	return b.sendMsg(newCtx, "", groupID, index, constant.ReadGroupChatType, content)
 }
 
 func (b *SendMsgUser) SendSingleMsg(ctx context.Context, userID string, index int) error {
@@ -217,7 +223,7 @@ func (b *SendMsgUser) sendMsg(ctx context.Context, userID, groupID string, index
 		SenderNickname:   b.userID,
 		Content:          []byte(utils.StructToJsonString(text)),
 		CreateTime:       time.Now().UnixMilli(),
-		SenderPlatformID: pbconstant.AdminPlatformID,
+		SenderPlatformID: b.platformID,
 		ClientMsgID:      clientMsgID,
 	}
 	// IncrementQPS()

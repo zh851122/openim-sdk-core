@@ -6,6 +6,7 @@ import (
 	"github.com/openimsdk/tools/utils/datautil"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,6 +66,7 @@ type PressureTester struct {
 	userManager            *TestUserManager
 	groupManager           *TestGroupManager
 	msgSender              map[string]*SendMsgUser
+	userToken              map[string]string
 	rw                     sync.RWMutex
 	groupRandomSender      map[string][]string
 	groupRandomOnlineUsers map[string][]string
@@ -122,6 +124,7 @@ func NewPressureTester() (*PressureTester, error) {
 	return &PressureTester{friendManager: metaManager.NewFriendManager(), userManager: metaManager.NewUserManager(),
 		groupManager:      metaManager.NewGroupMananger(),
 		msgSender:         make(map[string]*SendMsgUser),
+		userToken:         make(map[string]string),
 		groupRandomSender: make(map[string][]string), groupOwnerUserID: make(map[string]string),
 		groupMemberNum: make(map[string]int),
 		timeOffset:     serverTime - utils.GetCurrentTimestampByMill()}, nil
@@ -171,13 +174,37 @@ func (p *PressureTester) SelectStartAndEnd(start, end int) (fastenedUserIDs []st
 }
 
 func (p *PressureTester) RegisterUsers(userIDs []string, fastenedUserIDs []string, recvMsgUserIDs []string) error {
+	registerBatch := func(ids []string) error {
+		if len(ids) == 0 {
+			return nil
+		}
+		err := p.userManager.RegisterUsers(ids...)
+		if err == nil {
+			return nil
+		}
+		// idempotent register: if part of users already exist, retry one-by-one and skip duplicates.
+		if strings.Contains(err.Error(), "1102 RegisteredAlreadyError") || strings.Contains(strings.ToLower(err.Error()), "registeredalreadyerror") {
+			for _, uid := range ids {
+				if e := p.userManager.RegisterUsers(uid); e != nil {
+					msg := strings.ToLower(e.Error())
+					if strings.Contains(msg, "1102 registeredalreadyerror") || strings.Contains(msg, "registeredalreadyerror") {
+						continue
+					}
+					return e
+				}
+			}
+			return nil
+		}
+		return err
+	}
+
 	for i := 0; i < len(userIDs); i += 1000 {
 		end := i + 1000
 		if end > len(userIDs) {
 			end = len(userIDs)
 		}
 		userIDsSlice := userIDs[i:end]
-		if err := p.userManager.RegisterUsers(userIDsSlice...); err != nil {
+		if err := registerBatch(userIDsSlice); err != nil {
 			return err
 		}
 		if len(userIDsSlice) < 1000 {
@@ -185,12 +212,12 @@ func (p *PressureTester) RegisterUsers(userIDs []string, fastenedUserIDs []strin
 		}
 	}
 	if len(fastenedUserIDs) != 0 {
-		if err := p.userManager.RegisterUsers(fastenedUserIDs...); err != nil {
+		if err := registerBatch(fastenedUserIDs); err != nil {
 			return err
 		}
 	}
 	if len(recvMsgUserIDs) != 0 {
-		if err := p.userManager.RegisterUsers(recvMsgUserIDs...); err != nil {
+		if err := registerBatch(recvMsgUserIDs); err != nil {
 			return err
 		}
 	}
@@ -198,17 +225,32 @@ func (p *PressureTester) RegisterUsers(userIDs []string, fastenedUserIDs []strin
 }
 
 func (p *PressureTester) InitUserConns(userIDs []string) {
+	connected := 0
+	tokenFailed := 0
 	for _, userID := range userIDs {
 		token, err := p.userManager.GetToken(userID, int32(PLATFORMID))
 		if err != nil {
+			tokenFailed++
 			log.ZError(context.Background(), "get token failed", err, "userID", userID, "platformID", PLATFORMID)
 			continue
 		}
 		user := NewUser(userID, token, p.timeOffset, p, sdk_struct.IMConfig{WsAddr: WSADDR, ApiAddr: APIADDR, PlatformID: int32(PLATFORMID)})
+		p.rw.Lock()
 		p.msgSender[userID] = user
+		p.userToken[userID] = token
+		p.rw.Unlock()
+		connected++
 
 	}
+	log.ZWarn(context.Background(), "init user conns finished", nil, "targetUsers", len(userIDs), "connectedUsers", connected, "tokenFailedUsers", tokenFailed)
 
+}
+
+func (p *PressureTester) getUserToken(userID string) (string, bool) {
+	p.rw.RLock()
+	defer p.rw.RUnlock()
+	token, ok := p.userToken[userID]
+	return token, ok
 }
 
 func (p *PressureTester) getGroup(fastenedUserIDs []string, groupMemberNum int, groupSenderRate, groupOnlineRate float64) (ownerUserID string,
@@ -346,6 +388,230 @@ func (p *PressureTester) sendMessage2Groups(senderIDs []string, groupID string, 
 
 	}
 	wg.Wait()
+}
+
+func (p *PressureTester) JoinUsersToGroup(ctx context.Context, groupID string, userIDs []string, _ int32, concurrency int) (joined int64, failed int64) {
+	if groupID == "" {
+		log.ZError(ctx, "join users to group failed", nil, "reason", "groupID is empty")
+		return 0, int64(len(userIDs))
+	}
+	if len(userIDs) == 0 {
+		return 0, 0
+	}
+	if concurrency <= 0 {
+		concurrency = 200
+	}
+
+	var (
+		wg      sync.WaitGroup
+		sem     = make(chan struct{}, concurrency)
+		success atomic.Int64
+		fail    atomic.Int64
+		mu      sync.Mutex
+		reasons = make(map[string]int64)
+	)
+	start := time.Now()
+
+	for _, uid := range userIDs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(userID string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			token, ok := p.getUserToken(userID)
+			if !ok || token == "" {
+				fail.Add(1)
+				mu.Lock()
+				reasons["user token missing from active connections"]++
+				mu.Unlock()
+				log.ZDebug(ctx, "join group by user failed", "userID", userID, "groupID", groupID, "reason", "user token missing")
+				return
+			}
+			var err error
+			for attempt := 0; attempt < 3; attempt++ {
+				err = p.groupManager.JoinGroupByUserToken(userID, token, groupID)
+				if err == nil {
+					break
+				}
+				if strings.Contains(err.Error(), "1507 TokenNotExistError") {
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
+				break
+			}
+			if err != nil {
+				if isBenignJoinError(err) {
+					success.Add(1)
+					mu.Lock()
+					reasons["benign:"+err.Error()]++
+					mu.Unlock()
+					return
+				}
+				fail.Add(1)
+				mu.Lock()
+				reasons[err.Error()]++
+				mu.Unlock()
+				log.ZDebug(ctx, "join group by user failed", "userID", userID, "groupID", groupID, "err", err)
+				return
+			}
+			success.Add(1)
+		}(uid)
+	}
+	wg.Wait()
+
+	joined = success.Load()
+	failed = fail.Load()
+	log.ZWarn(ctx, "join users to group finished", nil, "groupID", groupID, "userCount", len(userIDs),
+		"joined", joined, "failed", failed, "concurrency", concurrency, "costMs", time.Since(start).Milliseconds())
+	if failed > 0 {
+		log.ZWarn(ctx, "join users to group fail reasons", nil, "groupID", groupID, "failReasonMap", reasons)
+	}
+	return joined, failed
+}
+
+func isBenignJoinError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	// The user may already be in group (server returns ArgsError in this case).
+	if strings.Contains(msg, "1001 argserror") {
+		return true
+	}
+	// Some deployments create conversation records with a unique key conflict, but member insert is done.
+	if strings.Contains(msg, "duplicate key error") &&
+		strings.Contains(msg, "conversation_id_1") &&
+		strings.Contains(msg, "sg_") {
+		return true
+	}
+	return false
+}
+
+func (p *PressureTester) SendLiveRoomMessages(ctx context.Context, groupID string, senderIDs []string, count int, duration time.Duration, concurrency int, targetQPS int) {
+	log.ZWarn(ctx, "send live room messages start", nil, "groupID", groupID, "senderCount", len(senderIDs), "count", count, "targetQPS", targetQPS)
+	if groupID == "" || len(senderIDs) == 0 {
+		log.ZWarn(ctx, "send live room messages skip", nil, "groupID", groupID, "senderCount", len(senderIDs), "count", count, "targetQPS", targetQPS)
+		return
+	}
+	infinite := count <= 0
+	rand.Seed(time.Now().UnixNano())
+	if concurrency <= 0 {
+		concurrency = 500
+	}
+	if targetQPS < 0 {
+		targetQPS = 0
+	}
+
+	var qpsLimiter <-chan struct{}
+	if targetQPS > 0 {
+		interval := time.Second / time.Duration(targetQPS)
+		if interval <= 0 {
+			interval = time.Nanosecond
+		}
+		tokens := make(chan struct{}, targetQPS)
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					close(tokens)
+					return
+				case <-ticker.C:
+					select {
+					case tokens <- struct{}{}:
+					default:
+					}
+				}
+			}
+		}()
+		qpsLimiter = tokens
+	}
+	var (
+		wg     sync.WaitGroup
+		sem    = make(chan struct{}, concurrency)
+		sent   atomic.Int64
+		failed atomic.Int64
+	)
+	start := time.Now()
+
+	for _, uid := range senderIDs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(userID string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			for i := 0; ; i++ {
+				if !infinite && i >= count {
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				if qpsLimiter != nil {
+					select {
+					case <-ctx.Done():
+						return
+					case _, ok := <-qpsLimiter:
+						if !ok {
+							return
+						}
+					}
+				}
+				if user, ok := p.msgSender[userID]; ok {
+					content := randomLiveRoomContent()
+					if err := user.SendGroupCustomMsgWithContext(groupID, i, content); err != nil {
+						failed.Add(1)
+					} else {
+						sent.Add(1)
+					}
+				} else {
+					failed.Add(1)
+				}
+				if qpsLimiter == nil && duration > 0 {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(duration):
+					}
+				}
+			}
+		}(uid)
+	}
+	wg.Wait()
+	log.ZWarn(ctx, "send live room messages finished", nil, "groupID", groupID, "senderCount", len(senderIDs),
+		"count", count, "concurrency", concurrency, "costMs", time.Since(start).Milliseconds(),
+		"infinite", infinite, "sent", sent.Load(), "failed", failed.Load(), "targetQPS", targetQPS)
+}
+
+var liveWordPool = []string{
+	"hello", "nice", "awesome", "great", "amazing", "cool", "love", "wow", "fire", "hype",
+	"stream", "live", "music", "dance", "party", "boss", "legend", "happy", "good", "night",
+	"today", "moment", "energy", "crazy", "strong", "respect", "support", "fast", "smooth", "online",
+}
+
+var liveEmojiPool = []string{
+	"\U0001F600", "\U0001F601", "\U0001F602", "\U0001F60E", "\U0001F60D", "\U0001F929", "\U0001F973", "\U0001F525", "\U0001F680", "\U0001F389",
+	"\U0001F4AF", "\u2764\ufe0f", "\U0001F44D", "\U0001F44F", "\U0001F3B6", "\u2728", "\u26A1", "\U0001F606", "\U0001F91F", "\U0001F64C",
+}
+
+func randomLiveRoomContent() string {
+	wordCount := 4 + rand.Intn(7)
+	var builder strings.Builder
+	for i := 0; i < wordCount; i++ {
+		if i > 0 {
+			builder.WriteByte(' ')
+		}
+		builder.WriteString(liveWordPool[rand.Intn(len(liveWordPool))])
+	}
+	builder.WriteByte(' ')
+	emojiCount := 1 + rand.Intn(3)
+	for i := 0; i < emojiCount; i++ {
+		builder.WriteString(liveEmojiPool[rand.Intn(len(liveEmojiPool))])
+	}
+	return builder.String()
 }
 
 // func (p *PressureTester) SendSingleMessages(fastenedUserIDs []string, num int, duration time.Duration) {

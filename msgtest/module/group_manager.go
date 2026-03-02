@@ -7,6 +7,7 @@ import (
 	"github.com/openimsdk/openim-sdk-core/v3/pkg/constant"
 	"time"
 
+	pbconstant "github.com/openimsdk/protocol/constant"
 	"github.com/openimsdk/protocol/group"
 	"github.com/openimsdk/protocol/sdkws"
 )
@@ -73,4 +74,22 @@ func (t *TestGroupManager) InviteUserToGroup(ctx context.Context, groupID string
 	}
 	resp := &group.InviteUserToGroupResp{}
 	return t.postWithCtx(api.InviteUserToGroup.Route(), &req, &resp)
+}
+
+func (t *TestGroupManager) JoinGroupByUserToken(userID string, token string, groupID string) error {
+	if token == "" {
+		return fmt.Errorf("empty user token")
+	}
+	req := &group.JoinGroupReq{
+		GroupID:    groupID,
+		ReqMessage: "live pressure test join",
+		JoinSource: pbconstant.JoinBySearch,
+		// openim server JoinGroup reads InviterUserID directly.
+		InviterUserID: userID,
+	}
+	resp := &group.JoinGroupResp{}
+	if err := t.postWithTokenCtx(api.JoinGroup.Route(), token, req, resp); err != nil {
+		return fmt.Errorf("join group failed: %w", err)
+	}
+	return nil
 }
