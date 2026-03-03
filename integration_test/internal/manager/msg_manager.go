@@ -99,6 +99,16 @@ func (m *TestMsgManager) sendSingleMessages(ctx context.Context, gr *reerrgroup.
 
 // sendGroupMessages see SendMessages
 func (m *TestMsgManager) sendGroupMessages(ctx context.Context, gr *reerrgroup.Group, p *progress.Progress) {
+	var groupSendTicker *time.Ticker
+	if vars.GroupSendRate > 0 {
+		interval := time.Second / time.Duration(vars.GroupSendRate)
+		if interval <= 0 {
+			interval = time.Nanosecond
+		}
+		groupSendTicker = time.NewTicker(interval)
+		defer groupSendTicker.Stop()
+	}
+
 	for userNum := 0; userNum < vars.LoginUserNum; userNum++ {
 		userNum := userNum
 		ctx := vars.Contexts[userNum]
@@ -109,10 +119,22 @@ func (m *TestMsgManager) sendGroupMessages(ctx context.Context, gr *reerrgroup.G
 				return err
 			}
 			sendGroups := make([]string, 0)
-			for _, group := range groups {
-				if int(group.MemberCount) == vars.LargeGroupMemberNum || group.OwnerUserID == testSDK.UserID {
-					// is larger group or created by oneself
-					sendGroups = append(sendGroups, group.GroupID)
+			if vars.TargetGroupID != "" {
+				for _, group := range groups {
+					if group.GroupID == vars.TargetGroupID {
+						sendGroups = append(sendGroups, group.GroupID)
+						break
+					}
+				}
+				if len(sendGroups) == 0 {
+					return fmt.Errorf("user %s has not joined target group %s", testSDK.UserID, vars.TargetGroupID)
+				}
+			} else {
+				for _, group := range groups {
+					if int(group.MemberCount) == vars.LargeGroupMemberNum || group.OwnerUserID == testSDK.UserID {
+						// is larger group or created by oneself
+						sendGroups = append(sendGroups, group.GroupID)
+					}
 				}
 			}
 
@@ -134,6 +156,9 @@ func (m *TestMsgManager) sendGroupMessages(ctx context.Context, gr *reerrgroup.G
 					t := time.Now()
 					log.ZWarn(ctx, "sendGroupMessages begin", nil)
 					ctx = ccontext.WithSendMessageCallback(ctx, sdk_user_simulator.TestSendMsgCallBackListener{UserID: msg.SendID})
+					if groupSendTicker != nil {
+						<-groupSendTicker.C
+					}
 					_, err = testSDK.SendGroupMsg(ctx, msg, group)
 					if err != nil {
 						return err
@@ -141,7 +166,9 @@ func (m *TestMsgManager) sendGroupMessages(ctx context.Context, gr *reerrgroup.G
 					log.ZWarn(ctx, "sendGroupMessages end", nil, "time cost:", time.Since(t))
 
 					p.IncBar(bar)
-					time.Sleep(time.Millisecond * 500)
+					if groupSendTicker == nil {
+						time.Sleep(time.Millisecond * 500)
+					}
 				}
 			}
 			return nil

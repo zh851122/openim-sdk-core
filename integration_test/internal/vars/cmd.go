@@ -9,6 +9,8 @@ var (
 	CommonGroupMemberNum int // number of common group member num
 	SingleMessageNum     int // number of single message each user send
 	GroupMessageNum      int // number of group message each user send
+	TargetGroupID        string
+	GroupSendRate        int // target group send rate(messages per second), global across all users
 
 	ShouldRegister      bool // determine whether register
 	ShouldImportFriends bool // determine whether import friends
@@ -34,6 +36,8 @@ var (
 		"CommonGroupMemberNum":       "cgm",
 		"SingleMessageNum":           "sm",
 		"GroupMessageNum":            "gm",
+		"TargetGroupID":              "tgid",
+		"GroupSendRate":              "gsr",
 		"ShouldRegister":             "reg",
 		"ShouldImportFriends":        "imf",
 		"ShouldCreateGroup":          "crg",
